@@ -1,3 +1,5 @@
+BotGate v2.4 -- optional geo-blocklists
+
 Drop IP2Location-format geo-block files here.
 
 Every *.txt file in this directory is loaded automatically at
@@ -11,3 +13,8 @@ IP2Location recommends refreshing these files monthly. This
 directory ships empty; geo-blocking is entirely opt-in.
 
 See botgate.md, Section 8, for full details.
+
+The managed AbuseIPDB feed is separate from these country files. BotGate
+stores its automatically refreshed abuseipdb.can in the configured can_dir,
+normally can/, and does not automatically download or refresh geo files.
+See botgate.md, Section 7a, for the managed-feed settings.

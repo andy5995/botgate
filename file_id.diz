@@ -1,8 +1,8 @@
-BotGate v2.3 - TCP bot gate for
+BotGate v2.4 - TCP gate for
 any telnet BBS. ESC/* challenge
 before reaching your real BBS.
-NEW: multi-listener support --
-protect 2+ apps from one BotGate.
+Managed AbuseIPDB IPv4 feed,
+multi-listener shared protection.
 Custom ANSI prompts, live count-
 down, .can blocklists, geo-block,
 reverse-DNS, auto rate-limit bans.

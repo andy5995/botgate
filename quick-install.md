@@ -1,4 +1,4 @@
-# BotGate — Quick Install
+# BotGate v2.4 — Quick Install
 
 0. Need Python first? Requires **3.6+**.
    - Windows: [python.org/downloads](https://www.python.org/downloads/) — check "Add python.exe to PATH" during install.
@@ -10,6 +10,12 @@
 2. Edit `botgate_proxy.cfg`:
    - `backend_host` / `backend_port` → your real BBS's address
    - `listen_port` → the port callers will connect to (usually your BBS's current public port)
+   - Under `[proxy]`, `abuseipdb update = 12` → refresh the managed IPv4
+     reputation list every 12 hours. `0` disables both downloads and feed
+     blocking. It defaults to `12` even if omitted from an older config.
+     Enabled BotGate needs outbound HTTPS access to `raw.githubusercontent.com`
+     and write access to `can_dir` to save `abuseipdb.can`. A download failure
+     does not stop startup; any valid cache remains active.
 
    **Running everything on one PC?** That's fine — `backend_host` can just be `127.0.0.1`, with your BBS listening on a different local port than BotGate.
 
@@ -32,3 +38,13 @@
 **Protecting a second app too?** (2.3+) Add a `[Listener2]` section to `botgate_proxy.cfg` with its own `listen_port`/`backend_host`/`backend_port` — no changes needed to `[proxy]` or anything else. See `botgate.md`, Section 19.
 
 Full documentation: see `botgate.md`
+
+**Upgrading an existing installation?** Keep your production configuration,
+prompt art, and local blocklists. Stop BotGate, replace the script with v2.4, then
+add the commented `abuseipdb update` setting from the sample config under your
+existing `[proxy]` section. Do not overwrite your configuration with the sample's
+backend values. The feed cache is created after the first successful refresh;
+never install a bundled snapshot over your existing cache. Restart BotGate
+after updating the script and config. Refresh results log at INFO; callers
+blocked by this feed log at WARNING. Updates replace the full feed, including
+upstream removals. See Section 7a of `botgate.md` for details.

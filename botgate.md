@@ -1,7 +1,7 @@
 # BotGate
 
 **A TCP-Level Bot Gate for BBS Systems**
-Version 2.3 — User Guide & Configuration Reference
+Version 2.4 — User Guide & Configuration Reference
 
 BotGate is a standalone Python 3 program that stands in front of a BBS's real telnet port and requires each caller to prove they can follow a simple interactive instruction — pressing ESC or `*` twice — before the actual BBS software ever sees the connection. Callers who don't respond (or who are obviously automated, not human) are disconnected without ever reaching the BBS.
 
@@ -17,6 +17,7 @@ It was originally built to protect a Spitfire BBS node running behind a NetSeria
 6. [Custom Prompts & the Live Countdown](#6-custom-prompts--the-live-countdown)
    - [6a. Startup Banner (local console, optional)](#6a-startup-banner-local-console-optional)
 7. [Blocklists (.can files)](#7-blocklists-can-files)
+   - [Managed AbuseIPDB feed](#7a-managed-abuseipdb-feed)
 8. [Geo-Blocking (/geo directory)](#8-geo-blocking-geo-directory)
 9. [Reverse DNS (host.can)](#9-reverse-dns-hostcan)
 10. [Per-IP Connection Cap](#10-per-ip-connection-cap)
@@ -150,12 +151,74 @@ BotGate supports Synchronet-style `.can` blocklist files, located in the directo
 | `ip-silent.can` | Blocked IPs/CIDR/wildcards. Matches are **not** logged — useful for known noise sources you don't want cluttering your logs. |
 | `host.can` | Blocked hostname patterns, checked against each connecting IP's reverse-DNS result (see Section 9). |
 | `temp_ip.can` | Fully auto-managed by the rate limiter (Section 11). Auto-created if missing; there's no need to hand-create it. |
+| `abuseipdb.can` | Managed exact-IPv4 reputation snapshot, refreshed automatically (Section 7a). Created after the first successful download. |
 
-With the exception of `temp_ip.can` (which updates live as bans are issued and expire), these files are loaded once at startup. Restart BotGate to pick up manual edits.
+The normal local files are loaded once at startup; restart BotGate to pick up
+manual edits. `temp_ip.can` updates live as bans are issued and expire.
+`abuseipdb.can` is maintained separately and successful refreshes apply live.
 
 ### Evaluation order
 
-`exempt` → `temp_ip.can` → `ip.can` → `ip-silent.can` → geo blocklists → `host.can` → rate-limit check → gate. The first match wins; exempt IPs skip every subsequent check entirely.
+`exempt` → `temp_ip.can` → enabled `abuseipdb.can` → `ip.can` → `ip-silent.can` → geo blocklists → `host.can` → rate-limit check → gate. The first match wins; exempt IPs skip every subsequent check entirely. An address present in multiple lists is logged according to the first matching source.
+
+## 7a. Managed AbuseIPDB Feed
+
+In the existing `[proxy]` section:
+
+```ini
+; Hours between managed-feed refresh attempts; 0 disables it.
+abuseipdb update = 12
+```
+
+- `12` (default): immediately check after startup, then wait 12 hours after
+  each attempt before trying again. `24` uses 24 hours instead.
+- `0`: disable both downloads and blocking by this feed. Keep its file on disk.
+- Omitted setting: defaults to `12`, including when upgrading an older config.
+- Values must be nonnegative whole hours within the platform's timer limit.
+  Invalid values stop startup with a clear configuration error.
+
+The single updater and current snapshot are shared by all listeners. This
+feature makes periodic outbound HTTPS requests to the public
+[borestad/blocklist-abuseipdb 30-day IPv4 feed](https://raw.githubusercontent.com/borestad/blocklist-abuseipdb/refs/heads/main/abuseipdb-s100-30d.ipv4).
+It does not use the AbuseIPDB API, require an API key, or submit caller data.
+
+The local managed file is `abuseipdb.can` inside `can_dir` (normally
+`can/abuseipdb.can` beside the script). BotGate loads a readable, valid cache
+before accepting callers; an older cache remains usable. Comments and blank
+lines are allowed, and entries must be exact IPv4 addresses. The upstream's
+inline country/ASN comments are handled. No CIDR ranges, wildcards, IPv6, or
+negation rules are accepted in this specific managed file.
+
+With no valid cache, BotGate starts using its other protections and attempts a
+background download. Callers never wait for a download. A successful refresh
+validates the entire response, atomically replaces the cache, then activates
+the new snapshot without restarting listeners. Addresses removed upstream
+stop being blocked by this feed; other local blocklists still apply.
+
+Network, parsing, or cache-write failures retain the last valid file and active
+snapshot. If none exists, the feed remains inactive until a successful update;
+the other protections continue. Downloads have a 32 MiB size limit, a 15-second
+socket timeout, and a 60-second deadline checked between reads. The declared
+HTTP length (when provided) and upstream address-count header must agree with
+the response. Empty, malformed, or incomplete responses cannot replace the cache.
+
+Update results and failure reasons log at INFO, for example:
+
+```text
+[INFO] abuseipdb.can updated: 149969 addresses (+120 added, -85 removed).
+[INFO] abuseipdb.can update failed: connection timed out; keeping previous list.
+[WARNING] [23230] 203.0.113.42 blocked by abuseipdb.can.
+```
+
+With `log_level = WARNING` or `ERROR`, INFO update messages are filtered out.
+Exempt IPs bypass the feed. Feed rejections occur before the gate and backend
+connection, with the listener port and `abuseipdb.can` recorded as the reason.
+
+**This file is managed by BotGate.** Manual edits are overwritten on refresh.
+Use `ip.can` for permanent local blocks and `ipfilter_exempt.cfg` for trusted
+exceptions. The download cache is not included in the package; BotGate creates
+it on the first successful update. Ensure the service account can write to
+`can_dir`. Restart BotGate after changing the refresh interval or disable option.
 
 ## 8. Geo-Blocking (/geo directory)
 
@@ -220,7 +283,7 @@ Separately, the in-memory tracking used to *detect* rate-limit violations (not t
 Controlled by `log_file` (blank disables file logging; console output always happens) and `log_level`:
 
 - **DEBUG** — everything, including raw gate-phase bytes in hex and every reverse-DNS result, regardless of outcome.
-- **INFO** — connection accepted, gate pass/fail, IP-cap rejections, rate-limit bans, backend handoff, connection closed.
+- **INFO** — connection accepted, gate pass/fail, IP-cap rejections, rate-limit bans, backend handoff, connection closed, managed-feed cache loading and refresh successes/failures.
 - **WARNING** — blocklist rejections, backend-unreachable errors, rate-limit bans, file read/write problems.
 - **ERROR** — unexpected failures in the gate logic itself.
 
@@ -239,6 +302,7 @@ Controlled by `log_file` (blank disables file logging; console output always hap
 | `log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. `DEBUG` adds raw gate-phase bytes and reverse-DNS results. |
 | `ip_cap` | `2` | Max simultaneous connections per source IP. `0` disables. |
 | `can_dir` | `can` | Directory holding the `.can` blocklist files (see Section 7). |
+| `abuseipdb update` | `12` | Shared managed-feed refresh interval in whole hours. `0` disables downloads and feed blocking, retaining the cache. See Section 7a. |
 | `geo_dir` | `geo` | Directory of IP2Location-style geo-block `.txt` files (see Section 8). |
 | `dns_lookup_enabled` | `yes` | Whether to reverse-DNS each connecting IP and check `host.can`. |
 | `rate_limit_hits` | `20` | Connection attempts within the window that trigger an auto temp-ban. `0` disables. |
@@ -271,7 +335,22 @@ Telnet protocol negotiation handling — the IAC constant definitions and the `s
 
 Thanks also to [Digital Man](https://www.synchro.net/) of the Synchronet project, whose `.can`-file filtering conventions inspired BotGate's own blocklist format and the concept behind its IAC-stripping input filter.
 
+The managed reputation list comes from [borestad/blocklist-abuseipdb](https://github.com/borestad/blocklist-abuseipdb).
+Its feed credits [AbuseIPDB](https://www.abuseipdb.com/) and [IPinfo](https://ipinfo.io/).
+
 ## 17. Version History
+
+### v2.4
+
+- Added the shared managed `abuseipdb.can` feed, background refreshes, cached
+  startup protection, atomic snapshot replacement, and update/block logging.
+- Added the commented `[proxy]` setting `abuseipdb update = 12`; `0` disables it.
+- Successful refreshes replace the complete feed snapshot, applying upstream
+  additions and removals without a restart. Failures keep the last valid list;
+  local exemptions remain authoritative.
+- Added standard-library unit, socket, and process tests, plus GitHub Actions
+  syntax/test checks on Linux, Windows, and macOS with Python 3.12. See
+  `tests/README.md` for commands and coverage limits.
 
 ### v1.0
 
@@ -376,7 +455,7 @@ Each listener section supports these keys:
 | `prompt_file` | no | The caller-facing gate screen for this listener. Left blank, it falls back to `[proxy]`'s own `prompt_file` -- so you only need to set it on the listeners that should look different. |
 | `send_proxy_protocol` | no | See the callout below -- this one does **not** fall back to `[proxy]`'s value. Defaults to `no` per listener. |
 
-**Most other settings are shared, not per-listener.** `timeout_seconds`, `required_hits`, `live_countdown`, `ip_cap`, `can_dir`/`geo_dir` blocklists, `dns_lookup_enabled`, rate limiting, `banner_file`, `log_file`/`log_level`, and `max_connections` all come from `[proxy]` and apply identically to every listener. This is deliberate: a bot (or a legitimate caller) hitting two different listeners from the same IP is still governed by the same `ip_cap` and rate-limit counters, not given a fresh allowance by spreading itself across ports, and `max_connections` remains a true ceiling on the process as a whole.
+**Most other settings are shared, not per-listener.** `timeout_seconds`, `required_hits`, `live_countdown`, `ip_cap`, `can_dir`/`geo_dir` blocklists, `abuseipdb update`, `dns_lookup_enabled`, rate limiting, `banner_file`, `log_file`/`log_level`, and `max_connections` all come from `[proxy]` and apply identically to every listener. This is deliberate: a bot (or a legitimate caller) hitting two different listeners from the same IP is still governed by the same `ip_cap` and rate-limit counters, not given a fresh allowance by spreading itself across ports, and `max_connections` remains a true ceiling on the process as a whole.
 
 ### `send_proxy_protocol` and mixed backends
 

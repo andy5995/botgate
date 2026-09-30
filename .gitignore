@@ -12,6 +12,9 @@ env/
 *.tmp
 *.bak
 
+# BotGate-managed reputation cache (downloaded at runtime)
+abuseipdb.can
+
 # Editor and OS files
 .vscode/
 .idea/

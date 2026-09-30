@@ -42,8 +42,10 @@ import re
 import select
 import socket
 import sys
+import tempfile
 import threading
 import time
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "botgate_proxy.cfg")
@@ -90,7 +92,7 @@ log_file = botgate_proxy.log
 
 ; DEBUG also logs the raw bytes received during the gate phase (hex,
 ; truncated) -- useful for seeing what bots are actually sending.
-; INFO logs connection/pass/fail/handoff events only.
+; INFO logs connection/pass/fail/handoff events and managed-feed updates.
 log_level = INFO
 
 ; Max simultaneous connections allowed from the same source IP.
@@ -108,6 +110,22 @@ ip_cap = 2
 ; (e.g. 192.168.1.0/24), wildcard (*.example.com), or !negated to
 ; carve out an exception within the same file.
 can_dir = can
+
+; Automatically maintain can_dir/abuseipdb.can from the public GitHub
+; AbuseIPDB-derived IPv4 feed. No API key is needed. One shared list
+; protects ALL listeners. This makes an outbound HTTPS request to:
+; https://raw.githubusercontent.com/borestad/blocklist-abuseipdb/refs/heads/main/abuseipdb-s100-30d.ipv4
+; Value is a whole number of HOURS between refresh attempts; default 12.
+; Examples: 12 = twice a day, 24 = once a day, 0 = DISABLED (both
+; downloads and blocking from this feed; the cached file is retained).
+; A missing setting also defaults to 12, including on existing installs.
+; On startup, load any valid cache, then check for an update in the
+; background after listeners start. Refreshes apply without restarting.
+; Failed updates keep the last valid list. Exempt IPs still bypass it.
+; The managed file is created on the first successful update; manual
+; edits are replaced on refresh. Use ip.can/ipfilter_exempt.cfg instead.
+; Updates and failures log at INFO; matching IP blocks log at WARNING.
+abuseipdb update = 12
 
 ; Directory of Apache .htaccess-style "deny from x.x.x.x/nn" files
 ; (e.g. from https://www.ip2location.com/free/visitor-blocker).
@@ -308,7 +326,7 @@ class TelnetFilter:
 # ============================================================
 # Blocklists: Synchronet-style .can pattern files + IP2Location-
 # style geo .htaccess deny lists + reverse-DNS host matching.
-# All loaded once at startup (restart to pick up file changes).
+# Local lists load at startup; the managed AbuseIPDB feed updates live.
 # ============================================================
 
 class Pattern:
@@ -423,8 +441,193 @@ def geo_range_contains(ip_int, starts, ends):
     return i >= 0 and starts[i] <= ip_int <= ends[i]
 
 
+class AbuseIPDBFeed:
+    """One shared, immutable exact-IP snapshot with a background updater.
+
+    Download and validation never run in the caller path. A candidate must
+    be fully validated and saved atomically before it becomes active.
+    """
+
+    URL = "https://raw.githubusercontent.com/borestad/blocklist-abuseipdb/refs/heads/main/abuseipdb-s100-30d.ipv4"
+    MAX_BYTES = 32 * 1024 * 1024
+    SOCKET_TIMEOUT = 15
+    DOWNLOAD_TIMEOUT = 60
+    COUNT_RE = re.compile(r"^[#;]\s*Number of ips:\s*(\d+)\s*$", re.IGNORECASE)
+
+    def __init__(self, cfg):
+        self.update_hours = cfg["abuseipdb_update_hours"]
+        self.path = os.path.join(cfg["can_dir"], "abuseipdb.can")
+        self._ips = frozenset()
+        self._lock = threading.Lock()
+        self._refresh_lock = threading.Lock()
+        self._start_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        if self.update_hours:
+            self.load_cache()
+        else:
+            log.info("abuseipdb.can disabled (abuseipdb update = 0); cache retained.")
+
+    @classmethod
+    def validate(cls, body, require_count=False):
+        """Parse IPs and comments; verify the source's declared entry count.
+
+        Checking the header count detects a response cut off between valid
+        IP lines, without relying on a fixed historical list size.
+        """
+        if len(body) > cls.MAX_BYTES:
+            raise ValueError("feed exceeds the 32 MiB size limit")
+        text = body.decode("utf-8-sig")
+        ips = set()
+        entries = 0
+        declared_count = None
+        for line_number, raw in enumerate(text.splitlines(), 1):
+            line = raw.strip()
+            count_match = cls.COUNT_RE.fullmatch(line)
+            if count_match:
+                if declared_count is not None:
+                    raise ValueError("duplicate address-count header")
+                declared_count = int(count_match.group(1))
+            # The upstream list carries country/ASN comments after each IP.
+            value = re.split(r"[#;]", line, maxsplit=1)[0].strip()
+            if not value:
+                continue
+            try:
+                ip = str(ipaddress.IPv4Address(value))
+            except ValueError:
+                raise ValueError(f"invalid IPv4 entry on line {line_number}") from None
+            ips.add(ip)
+            entries += 1
+        if not ips:
+            raise ValueError("feed contains no IPv4 addresses")
+        if require_count and declared_count is None:
+            raise ValueError("source address-count header is missing")
+        if declared_count is not None and declared_count != entries:
+            raise ValueError(f"address count mismatch: expected {declared_count}, received {entries}")
+        return frozenset(ips)
+
+    def load_cache(self):
+        try:
+            with open(self.path, "rb") as cache:
+                candidate = self.validate(cache.read(self.MAX_BYTES + 1))
+            with self._lock:
+                self._ips = candidate
+            log.info("abuseipdb.can loaded %d cached addresses.", len(candidate))
+        except FileNotFoundError:
+            log.info("abuseipdb.can cache not found; will try a background update after startup.")
+        except (OSError, ValueError) as e:
+            log.info("abuseipdb.can cache could not be loaded: %s; continuing with other protections.", e)
+
+    def contains(self, ip: str) -> bool:
+        if not self.update_hours:
+            return False
+        with self._lock:
+            return ip in self._ips
+
+    def _download(self):
+        request = urllib.request.Request(self.URL, headers={"User-Agent": "BotGate-managed-feed"})
+        deadline = time.monotonic() + self.DOWNLOAD_TIMEOUT
+        with urllib.request.urlopen(request, timeout=self.SOCKET_TIMEOUT) as response:
+            if response.getcode() != 200:
+                raise ValueError(f"unexpected HTTP status {response.getcode()}")
+            if not response.geturl().lower().startswith("https://"):
+                raise ValueError("feed redirected to a non-HTTPS URL")
+            length_header = response.headers.get("Content-Length")
+            expected_length = int(length_header) if length_header is not None else None
+            if expected_length is not None and not 0 < expected_length <= self.MAX_BYTES:
+                raise ValueError("invalid or oversized Content-Length")
+            body = bytearray()
+            while True:
+                if self._stop.is_set():
+                    raise OSError("update cancelled during shutdown")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("feed download exceeded its time limit")
+                # read1 returns after one buffered/raw read, so a server that
+                # trickles data cannot hide the deadline inside read(n).
+                chunk = response.read1(min(65536, self.MAX_BYTES + 1 - len(body)))
+                if not chunk:
+                    break
+                body.extend(chunk)
+                if len(body) > self.MAX_BYTES:
+                    raise ValueError("feed exceeds the 32 MiB size limit")
+            if expected_length is not None and len(body) != expected_length:
+                raise ValueError("incomplete HTTP response")
+            return body
+
+    def _write_cache(self, candidate):
+        directory = os.path.dirname(self.path)
+        os.makedirs(directory, exist_ok=True)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="ascii", newline="\n",
+                                             dir=directory, prefix=".abuseipdb-",
+                                             suffix=".tmp", delete=False) as cache:
+                temporary_path = cache.name
+                cache.write("; AUTO-MANAGED BY BOTGATE\n"
+                            "; Manual edits will be replaced on the next successful refresh.\n"
+                            f"; Source: {self.URL}\n"
+                            f"; Last successful update: {datetime.now(timezone.utc).isoformat()}\n"
+                            f"; Number of ips: {len(candidate)}\n;\n")
+                for ip in sorted(candidate):
+                    cache.write(ip + "\n")
+                cache.flush()
+                os.fsync(cache.fileno())
+            os.replace(temporary_path, self.path)
+        finally:
+            if temporary_path is not None and os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+
+    def refresh(self) -> bool:
+        if not self.update_hours or not self._refresh_lock.acquire(blocking=False):
+            return False
+        try:
+            candidate = self.validate(self._download(), require_count=True)
+            if self._stop.is_set():
+                raise OSError("update cancelled during shutdown")
+            with self._lock:
+                previous = self._ips
+            added = len(candidate - previous)
+            removed = len(previous - candidate)
+            self._write_cache(candidate)
+            with self._lock:
+                self._ips = candidate
+            log.info("abuseipdb.can updated: %d addresses (+%d added, -%d removed).",
+                     len(candidate), added, removed)
+            return True
+        except Exception as e:
+            with self._lock:
+                has_previous = bool(self._ips)
+            retained = ("keeping previous list" if has_previous else
+                        "no feed snapshot is active; other protections remain active")
+            log.info("abuseipdb.can update failed: %s; %s.", e, retained)
+            return False
+        finally:
+            self._refresh_lock.release()
+
+    def start_updater(self):
+        with self._start_lock:
+            if not self.update_hours or self._thread is not None:
+                return
+            log.info("abuseipdb.can checking for an update now, then every %d hour(s).",
+                     self.update_hours)
+
+            def update_loop():
+                while not self._stop.is_set():
+                    self.refresh()
+                    if self._stop.wait(self.update_hours * 3600):
+                        return
+
+            self._thread = threading.Thread(target=update_loop, name="abuseipdb-updater", daemon=True)
+            self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+
+
 class BlockLists:
-    """Loads all .can files and geo blocklists once at startup."""
+    """Loads local lists at startup and owns the shared managed feed."""
 
     def __init__(self, cfg):
         can_dir = cfg["can_dir"]
@@ -434,6 +637,7 @@ class BlockLists:
         self.ip_can = PatternList.load(os.path.join(can_dir, "ip.can"))
         self.ip_silent = PatternList.load(os.path.join(can_dir, "ip-silent.can"))
         self.host_can = PatternList.load(os.path.join(can_dir, "host.can"))
+        self.abuseipdb = AbuseIPDBFeed(cfg)
 
         log.info(f"Loaded {len(self.exempt.patterns)} exempt, "
                  f"{len(self.ip_can.patterns)} ip.can, "
@@ -639,7 +843,7 @@ def check_access(ip, blocklists, cfg, rate_limiter):
     """Returns (action, reason). action is one of:
        'exempt'        -- always allowed, bypasses every other check
        'block_logged'  -- blocked, log it (ip.can / geo / host.can /
-                           temp_ip.can)
+                           temp_ip.can / abuseipdb.can)
        'block_silent'  -- blocked, do not log (ip-silent.can)
        'allow'         -- proceed to the IP cap / gate as normal
     """
@@ -648,6 +852,9 @@ def check_access(ip, blocklists, cfg, rate_limiter):
 
     if rate_limiter.is_banned(ip):
         return "block_logged", "temp_ip.can"
+
+    if blocklists.abuseipdb.contains(ip):
+        return "block_logged", "abuseipdb.can"
 
     if blocklists.ip_can.matches(ip):
         return "block_logged", "ip.can"
@@ -694,6 +901,16 @@ def load_config():
     cfg.read(CONFIG_FILE)
     p = cfg["proxy"]
 
+    try:
+        abuseipdb_update_hours = p.getint("abuseipdb update", 12)
+        if abuseipdb_update_hours < 0 or abuseipdb_update_hours * 3600 > threading.TIMEOUT_MAX:
+            raise ValueError("interval is negative or exceeds the platform timer limit")
+    except ValueError:
+        print("[botgate_proxy] Config error: abuseipdb update must be a whole number "
+              "of hours (0 disables; default 12), within the platform timer limit. "
+              "Fix botgate_proxy.cfg and rerun.")
+        sys.exit(1)
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
     def resolve_dir(value):
@@ -724,6 +941,7 @@ def load_config():
         "log_level": p.get("log_level", "INFO").strip().upper(),
         "ip_cap": p.getint("ip_cap", 2),
         "can_dir": resolve_dir(p.get("can_dir", "can").strip()),
+        "abuseipdb_update_hours": abuseipdb_update_hours,
         "geo_dir": resolve_dir(p.get("geo_dir", "geo").strip()),
         "dns_lookup_enabled": p.getboolean("dns_lookup_enabled", True),
         "rate_limit_hits": p.getint("rate_limit_hits", 20),
@@ -1309,6 +1527,7 @@ def main():
 
         log.info(f"BotGate running with {len(listeners)} listener(s). "
                  f"(max_connections={shared_cfg['max_connections']})")
+        blocklists.abuseipdb.start_updater()
 
         # The real work happens in the accept_loop threads above; the
         # main thread just waits here for Ctrl+C. KeyboardInterrupt is
@@ -1321,6 +1540,7 @@ def main():
     except KeyboardInterrupt:
         log.info("Shutting down.")
     finally:
+        blocklists.abuseipdb.stop()
         for sock in sockets:
             try:
                 sock.close()
