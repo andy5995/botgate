@@ -1,4 +1,4 @@
-BotGate v2.4 -- optional geo-blocklists
+BotGate v2.4.1 -- optional geo-blocklists
 
 Drop IP2Location-format geo-block files here.
 

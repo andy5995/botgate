@@ -32,6 +32,6 @@ jobs:
         with:
           python-version: '3.12'
       - name: Check Python syntax
-        run: python -m py_compile botgate_proxy.py tests/test_abuseipdb.py tests/test_smoke.py
+        run: python -m compileall -q botgate_proxy.py tests
       - name: Run unit and socket tests
         run: python -m unittest discover -s tests -v

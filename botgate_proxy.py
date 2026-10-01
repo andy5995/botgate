@@ -80,6 +80,7 @@ prompt_file =
 ; Whether a '#' placeholder (see prompt_file docs) live-updates once a
 ; second as a real countdown, or just shows the starting number once
 ; and stays static. Live updates work great on real terminal software
+; and retain the ANSI color/attributes active at the '#' placeholder.
 ; (SyncTERM, NetRunner, etc.) but some web-based telnet clients (e.g.
 ; fTelnet) don't handle the repeated cursor-positioning correctly and
 ; show garbled text. Set to no if a meaningful chunk of your callers
@@ -1010,7 +1011,8 @@ def load_config():
 DEFAULT_PROMPT_TEXT = b"\r\nPress ESC or * twice within ## seconds to continue...\r\n"
 
 PLACEHOLDER_RE = re.compile(rb"#+")
-ANSI_ESCAPE_RE = re.compile(rb"\x1b\[[0-9;]*[A-Za-z]")
+ANSI_ESCAPE_RE = re.compile(rb"\x1b\[[0-9;:]*[A-Za-z]")
+ANSI_SGR_RE = re.compile(rb"\x1b\[([0-9;:]*)m")
 
 log = logging.getLogger("botgate_proxy")
 
@@ -1059,10 +1061,44 @@ def get_prompt_template(cfg):
     return DEFAULT_PROMPT_TEXT
 
 
+def sgr_restore(data):
+    """Recreate formatting from SGR only; never replay cursor/art bytes.
+
+    Starting from a reset makes partial changes reproducible. Discard history
+    before the last full reset, while keeping zero-valued RGB/palette arguments
+    inside extended colors separate from actual SGR reset commands.
+    """
+    history = []
+    for match in ANSI_SGR_RE.finditer(data):
+        params = match.group(1).split(b";")
+        index = 0
+        reset = False
+        while index < len(params):
+            param = params[index]
+            code = int(param.split(b":")[0] or b"0")
+            if code == 0:
+                reset = True
+            elif (code in (38, 48, 58) and b":" not in param
+                  and index + 1 < len(params)):
+                # Semicolon-form indexed and RGB colors consume following
+                # parameters. Colon-form colors remain a single parameter.
+                mode = int(params[index + 1].split(b":")[0] or b"0")
+                if mode == 5:
+                    index += 2
+                elif mode == 2:
+                    index += 4
+            index += 1
+        if reset:
+            history.clear()
+        history.append(match.group(0))
+    return b"\x1b[0m" + b"".join(history)
+
+
 def build_prompt(cfg):
-    """Returns (initial_bytes, countdown). countdown is None for a
+    """Returns (initial_bytes, countdown, line_count). countdown is None for a
     fully static prompt (no '#' placeholder found -- old behavior,
-    unchanged), or (row, col, width) 1-based ANSI coordinates of a
+    unchanged), or (row, col, width, field_sgr, end_sgr): 1-based coordinates,
+    field width, and formatting to apply/restore around an update of a
     run of '#' characters, which get live-updated with the
     remaining seconds once a second during the gate. line_count is
     the total number of lines in the template, so callers can
@@ -1071,6 +1107,7 @@ def build_prompt(cfg):
     template = get_prompt_template(cfg)
     lines = template.split(b"\r\n")
     line_count = len(lines)
+    offset = 0
 
     for row_idx, line in enumerate(lines):
         m = PLACEHOLDER_RE.search(line)
@@ -1090,8 +1127,16 @@ def build_prompt(cfg):
             col = len(ANSI_ESCAPE_RE.sub(b"", line[:m.start()])) + 1
             row = row_idx + 1
             start_text = f"{int(cfg['timeout_seconds']):>{width}}".encode("ascii")[-width:]
+            field_sgr = end_sgr = b""
+            if ANSI_SGR_RE.search(template):
+                field_sgr = sgr_restore(template[:offset + m.start()])
+                end_sgr = sgr_restore(template)
+                if field_sgr == end_sgr:
+                    # The terminal is already in the field's formatting.
+                    field_sgr = end_sgr = b""
             lines[row_idx] = line[:m.start()] + start_text + line[m.end():]
-            return b"\r\n".join(lines), (row, col, width), line_count
+            return b"\r\n".join(lines), (row, col, width, field_sgr, end_sgr), line_count
+        offset += len(line) + 2
 
     return template, None, line_count
 
@@ -1156,9 +1201,10 @@ def run_gate(client_sock, cfg, addr):
             remaining_now = deadline - time.monotonic()
             shown = max(0, int(remaining_now + 0.999))  # ceiling, floor at 0
             if shown != last_shown:
-                row, col, width = countdown
+                row, col, width, field_sgr, end_sgr = countdown
                 text = f"{shown:>{width}}".encode("ascii")[-width:]
-                update = f"\x1b[{row};{col}H".encode("ascii") + text
+                update = (f"\x1b[{row};{col}H".encode("ascii")
+                          + field_sgr + text + end_sgr)
                 try:
                     client_sock.sendall(update)
                 except OSError:

@@ -1,4 +1,4 @@
-# BotGate v2.4
+# BotGate v2.4.1
 
 <p align="center">
   <img src="botgate-screenshot.jpg"
@@ -27,9 +27,22 @@ Originally built to protect a Spitfire BBS node running behind a NetSerial virtu
 
 ## Getting Started
 
+**Fixed in v2.4.1:** live countdown updates now retain the
+ANSI color and attributes active at `##`, including formatting inherited from
+an earlier line. The prompt's ending formatting is restored after each update.
+No new configuration setting is required. See [issue #2](https://github.com/xbit44/botgate/issues/2).
+
 See **[quick-install.md](quick-install.md)** for the bare-minimum steps to get running, and **[botgate.md](botgate.md)** for the full user guide — every configuration option, feature walkthroughs, and troubleshooting.
 
-### What's new in v2.4
+### What's new in v2.4.1
+
+- Fixed custom ANSI countdown numbers reverting to the prompt's ending color
+  during updates. Foreground/background colors and attributes active at `##`
+  are honored, including formatting carried over from an earlier line.
+- Added regression checks for colored countdowns, resets, plain/static prompts,
+  and successive updates over real sockets. The suite now contains 43 tests.
+
+### Added in v2.4
 
 - Managed AbuseIPDB feed shared by all listeners, with background refreshes.
 - Complete snapshot replacement: additions and removals take effect without a

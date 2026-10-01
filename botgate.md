@@ -1,7 +1,7 @@
 # BotGate
 
 **A TCP-Level Bot Gate for BBS Systems**
-Version 2.4 — User Guide & Configuration Reference
+Version 2.4.1 — User Guide & Configuration Reference
 
 BotGate is a standalone Python 3 program that stands in front of a BBS's real telnet port and requires each caller to prove they can follow a simple interactive instruction — pressing ESC or `*` twice — before the actual BBS software ever sees the connection. Callers who don't respond (or who are obviously automated, not human) are disconnected without ever reaching the BBS.
 
@@ -113,6 +113,11 @@ Set `prompt_file` to the path of any ANSI or ASCII file to fully customize what 
 ### Live countdown
 
 Include a run of `#` characters anywhere in the prompt file (for example `##`) and BotGate will substitute the starting timeout value there, then update it live, once per second, counting down — without redrawing anything else on the screen. The field width follows the number of `#` characters used: `##` gives a 2-digit field, `###` gives 3, and so on.
+
+The live numbers retain the ANSI color and attributes active at the placeholder,
+including formatting carried over from an earlier line. Each update restores
+the formatting left active at the end of the prompt after drawing the number.
+No separate countdown-color setting is needed; edit the prompt's ANSI formatting.
 
 Set `live_countdown = no` to disable the per-second updates — the starting number still displays (the `#` placeholder is still substituted), it just stays static rather than counting down. This is a compatibility option for clients whose ANSI handling still causes trouble even with the screen-reset fix above.
 
@@ -339,6 +344,16 @@ The managed reputation list comes from [borestad/blocklist-abuseipdb](https://gi
 Its feed credits [AbuseIPDB](https://www.abuseipdb.com/) and [IPinfo](https://ipinfo.io/).
 
 ## 17. Version History
+
+### v2.4.1
+
+- Fixed custom ANSI countdown numbers losing their authored color during live
+  refreshes (issue #2). Each update uses the color and attributes active at `##`,
+  including inherited formatting, then restores the prompt's ending formatting.
+- Preserved the initial prompt, countdown coordinates, and plain/static behavior.
+  No new configuration setting is required.
+- Added countdown-color regression tests, including successive real socket
+  updates; the standard-library suite now has 43 tests.
 
 ### v2.4
 

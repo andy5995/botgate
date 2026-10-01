@@ -1,4 +1,4 @@
-# BotGate v2.4 — Quick Install
+# BotGate v2.4.1 — Quick Install
 
 0. Need Python first? Requires **3.6+**.
    - Windows: [python.org/downloads](https://www.python.org/downloads/) — check "Add python.exe to PATH" during install.
@@ -40,9 +40,14 @@
 Full documentation: see `botgate.md`
 
 **Upgrading an existing installation?** Keep your production configuration,
-prompt art, and local blocklists. Stop BotGate, replace the script with v2.4, then
-add the commented `abuseipdb update` setting from the sample config under your
-existing `[proxy]` section. Do not overwrite your configuration with the sample's
+prompt art, and local blocklists. Stop BotGate, replace the script with v2.4.1,
+then restart. The countdown-color fix uses your prompt's existing ANSI colors;
+no new setting or prompt edit is required. Keep `live_countdown = yes` for live
+updates (`no` continues to show a static starting number).
+
+If upgrading from before v2.4, add the commented `abuseipdb update` setting from
+the sample config under your existing `[proxy]` section; the default when omitted
+is 12 hours. Do not overwrite your configuration with the sample's
 backend values. The feed cache is created after the first successful refresh;
 never install a bundled snapshot over your existing cache. Restart BotGate
 after updating the script and config. Refresh results log at INFO; callers

@@ -1,4 +1,4 @@
-# BotGate v2.4 checks
+# BotGate v2.4.1 checks
 
 From the BotGate source directory:
 
@@ -19,6 +19,13 @@ one shared updater, interval conversion, retries, and shutdown. Socket/process
 checks cover both listeners, ESC/star challenges, clear/home prompts,
 bidirectional relay, PROXY protocol, payload rejection, timeouts, backend
 unavailability, and per-IP/global connection caps.
+
+Countdown-color checks cover inherited ANSI formatting, partial/full resets,
+background and bright colors, indexed/RGB colors, unchanged initial art and
+coordinates, static/uncolored prompts, and actual successive socket updates.
+
+The v2.4.1 candidate passed all 43 tests on Windows 11 / Python 3.12.14. The
+owner also passed live production testing of the countdown-color fix on unix-bit.
 
 The v2.4 production-test candidate was checked on Windows 11 with Python 3.12.14.
 The actual HTTPS source was also checked separately in a disposable cache,
